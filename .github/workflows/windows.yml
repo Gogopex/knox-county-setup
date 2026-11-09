@@ -1,0 +1,40 @@
+name: Windows installer
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Test installation, updates and rollback
+        run: python -m unittest discover -p "test_*.py" -v
+      - name: Check embedded integration package
+        run: python knox_setup.py --self-test
+      - name: Build executable
+        run: |
+          python -m pip install pyinstaller==6.22.3
+          python -m PyInstaller --clean --onefile --windowed --name KnoxCountySetup --add-data "integration.json:." knox_setup.py
+      - name: Check executable and GUI startup
+        run: |
+          $p = Start-Process -FilePath dist\KnoxCountySetup.exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'Executable self-test failed' }
+          $p = Start-Process -FilePath dist\KnoxCountySetup.exe -ArgumentList '--gui-smoke' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw 'GUI startup failed' }
+      - name: Package
+        run: |
+          Compress-Archive -Path dist\KnoxCountySetup.exe,README.md,LICENSE,NOTICE.md -DestinationPath KnoxCountySetup-0.1.0-windows.zip
+          (Get-FileHash KnoxCountySetup-0.1.0-windows.zip -Algorithm SHA256).Hash.ToLower() + '  KnoxCountySetup-0.1.0-windows.zip' | Out-File SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            KnoxCountySetup-0.1.0-windows.zip
+            SHA256SUMS.txt
