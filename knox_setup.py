@@ -19,7 +19,7 @@ import urllib.request
 import webbrowser
 import zipfile
 
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 REPOSITORY = 'Gogopex/knox-county-setup'
 ROOT = Path(__file__).resolve().parent
 
@@ -80,7 +80,7 @@ def steam_closed():
         return
     output = subprocess.check_output(['tasklist', '/FO', 'CSV', '/NH'], creationflags=0x08000000).decode(errors='replace')
     if any(row and row[0].lower() == 'steam.exe' for row in csv.reader(output.splitlines())):
-        raise SetupError('For ZombieBuddy installation, exit Steam using Steam > Exit, then click Install / Update again. Its installer changes Steam launch options; Steam must be closed so those changes persist.')
+        raise SetupError('Please exit Steam using Steam > Exit, then retry. Setup changes Steam launch options; Steam must be closed so those changes persist.')
 
 
 @contextmanager
@@ -210,6 +210,106 @@ def apply_recipe(recipe, sources):
         raise SetupError('Integration output checksum failed: ' + recipe['path'])
     return data
 
+
+# Inserted into installer; no personal Steam configuration is edited during development.
+def vdf_tree(text):
+    tokens = [(m.group(), m.start(), m.end()) for m in re.finditer(r'"(?:\\.|[^"\\])*"|[{}]|//[^\r\n]*|[^\s{}"]+', text) if not m.group().startswith('//')]
+    index = 0
+    def value(raw):
+        if not raw.startswith('"'): return raw
+        return re.sub(r'\\([\\"nrt])', lambda m: {'n':'\n','r':'\r','t':'\t'}.get(m[1],m[1]), raw[1:-1])
+    def block(nested=False):
+        nonlocal index
+        node = {'entries': [], 'close': len(text)}
+        while index < len(tokens):
+            raw, start, end = tokens[index]
+            if raw == '}':
+                if not nested: raise SetupError('Unexpected Steam configuration brace')
+                node['close'] = start; index += 1; return node
+            if raw == '{': raise SetupError('Invalid Steam configuration key')
+            key = value(raw); index += 1
+            if index >= len(tokens): raise SetupError('Incomplete Steam configuration')
+            item, a, b = tokens[index]; index += 1
+            child = block(True) if item == '{' else {'value':value(item),'start':a,'end':b}
+            node['entries'].append((key, child, start))
+        if nested: raise SetupError('Incomplete Steam configuration block')
+        return node
+    return block()
+
+STEAM_APP_PATH = ['UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'Apps', '108600', 'LaunchOptions']
+
+def vdf_find(tree, path):
+    node = tree
+    for key in path:
+        matches = [child for name, child, _ in node.get('entries', []) if name.casefold() == key.casefold()]
+        if len(matches) > 1: raise SetupError('Duplicate Steam configuration key: ' + key)
+        if not matches: return None
+        node = matches[0]
+    return node
+
+def launch_options(text):
+    node = vdf_find(vdf_tree(text), STEAM_APP_PATH)
+    return None if node is None else node['value']
+
+def set_launch_options(text, options):
+    tree = vdf_tree(text); node = tree
+    for i, key in enumerate(STEAM_APP_PATH):
+        matches = [(child, start) for name, child, start in node.get('entries', []) if name.casefold() == key.casefold()]
+        if len(matches) > 1: raise SetupError('Duplicate Steam configuration key: ' + key)
+        if not matches:
+            if options is None: return text
+            def nested(parts):
+                if len(parts) == 1: return json.dumps(parts[0]) + '\t' + json.dumps(options, ensure_ascii=False)
+                return json.dumps(parts[0]) + '\n{\n' + nested(parts[1:]) + '\n}'
+            pos = node['close']
+            return text[:pos] + '\n' + nested(STEAM_APP_PATH[i:]) + '\n' + text[pos:]
+        child, key_start = matches[0]
+        if i == len(STEAM_APP_PATH) - 1:
+            if options is None: return text[:key_start] + text[child['end']:]
+            return text[:child['start']] + json.dumps(options, ensure_ascii=False) + text[child['end']:]
+        node = child
+    raise SetupError('Could not set Steam launch options')
+
+def steam_user_config(steam):
+    steam = Path(steam)
+    login = steam / 'config/loginusers.vdf'
+    if login.is_file():
+        users = vdf_find(vdf_tree(login.read_text(encoding='utf-8-sig')), ['users'])
+        if users:
+            recent = []
+            for sid, user, _ in users['entries']:
+                marker = vdf_find(user, ['MostRecent'])
+                if marker and marker['value'] == '1' and sid.isdigit(): recent.append(int(sid) - 76561197960265728)
+            if len(recent) == 1:
+                p = steam / 'userdata' / str(recent[0]) / 'config/localconfig.vdf'
+                if p.is_file(): return p
+    candidates = list((steam / 'userdata').glob('*/config/localconfig.vdf'))
+    if len(candidates) == 1: return candidates[0]
+    raise SetupError('Sign into Steam with the account you use for Zomboid, then exit Steam and retry. The active account could not be identified.')
+
+def native_zb_options(options):
+    options = options or ''
+    if re.search(r'(?i)(?:^|\s)-agentlib:zbNative(?:=\S+)?(?:\s|$)', options): return options.strip()
+    if re.search(r'(?<!\S)--(?!\S)', options):
+        return '-agentlib:zbNative ' + options.strip()
+    return '-agentlib:zbNative --' + (' ' + options.strip() if options.strip() else '')
+
+def profile_launch_options(options, profile):
+    options = options or ''
+    # Preserve all unrelated launch flags; replace only a previous cachedir argument.
+    options = re.sub(r'(?i)(?:"-cachedir=[^"]*"|-cachedir="[^"]*"|-cachedir=[^\s]+)', '', options).strip()
+    return native_zb_options(options) + ' "-cachedir=' + str(Path(profile).resolve()).replace('\\', '/') + '"'
+
+def write_steam_options(path, options):
+    path = Path(path)
+    original = path.read_text(encoding='utf-8-sig')
+    updated = set_launch_options(original, options)
+    if updated != original:
+        temp = path.with_name(path.name + '.knox-new')
+        temp.write_text(updated, encoding='utf-8')
+        os.replace(temp, path)
+
+
 class Transaction:
     """Durable undo journal. Files are backed up before replacement; interrupted runs are recoverable."""
     def __init__(self, profile):
@@ -247,6 +347,16 @@ class Transaction:
             shutil.copy2(staged, temp)
             os.replace(temp, target)
 
+    def steam_options(self, target, desired):
+        target = Path(target)
+        before = launch_options(target.read_text(encoding='utf-8-sig'))
+        if before == desired: return
+        backup = self.root / ('steam-options-' + str(len(self.record['actions'])) + '.json')
+        atomic_json(backup, {'path':str(target.resolve()), 'launch_options':before})
+        self.record['actions'].append({'steam_options':True, 'target':str(target.resolve()), 'backup':str(backup.resolve()), 'before':before, 'after':desired})
+        self.flush()
+        write_steam_options(target, desired)
+
     def commit(self):
         self.record['status'] = 'installed'
         self.flush()
@@ -259,6 +369,11 @@ class Transaction:
         keep = set()
         for a in reversed(r['actions']):
             target, backup = Path(a['target']), Path(a['backup'])
+            if a.get('steam_options'):
+                now = launch_options(target.read_text(encoding='utf-8-sig'))
+                if check and now not in (a['before'], a['after']):
+                    raise SetupError('Steam launch options changed since installation; restore stopped.')
+                continue
             now = tree_hashes(target) if a['folder'] else (file_sha(target) if target.exists() else None)
             interrupted_swap = a['folder'] and not target.exists() and backup.exists()
             if check and now not in (a['after'], a['before']) and not interrupted_swap:
@@ -269,6 +384,9 @@ class Transaction:
                 raise SetupError('Missing restore backup: ' + str(backup))
         for a in reversed(r['actions']):
             target, backup = Path(a['target']), Path(a['backup'])
+            if a.get('steam_options'):
+                write_steam_options(target, a['before'])
+                continue
             if str(target) in keep:
                 continue
             now = tree_hashes(target) if a['folder'] else (file_sha(target) if target.exists() else None)
@@ -344,10 +462,14 @@ def preflight(manifest, libraries, extras=True, xen=True, adjustments=True):
     return mods, sources
 
 
-def install(manifest, libraries, game, profile, extras=True, xen=True, adjustments=True, log=print, engine=True):
+def install(manifest, libraries, game, profile, extras=True, xen=True, adjustments=True, log=print, engine=True, steam=None):
     profile = Path(profile).resolve()
     with installation_lock(profile):
         game_closed()
+        steam_config = None
+        if steam is not None:
+            steam_closed()
+            steam_config = steam_user_config(steam)
         if pending_transactions(profile):
             raise SetupError('An interrupted installation needs Restore before trying again.')
         if engine:
@@ -408,11 +530,16 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
             tx.replace(profile / 'mods', dest, folder=True)
             for target, source in external:
                 tx.replace(target, source)
+            steam_state = None
+            if steam_config is not None:
+                desired = profile_launch_options(launch_options(steam_config.read_text(encoding='utf-8-sig')), profile)
+                tx.steam_options(steam_config, desired)
+                steam_state = {'path':str(steam_config.resolve()), 'options':desired}
             for target, source in settings:
                 tx.replace(target, source, preserve_edits=True)
             state = {'version': manifest['version'], 'options': {'extras': extras, 'xen': xen, 'adjustments': adjustments},
                      'mod_hashes': hashes, 'engine_files': {str(t.resolve()): file_sha(t) for t, _ in external},
-                     'receipt': str(tx.path.resolve()), 'game_build': manifest['game_build'], 'game': str(Path(game).resolve())}
+                     'receipt': str(tx.path.resolve()), 'game_build': manifest['game_build'], 'steam_launch':steam_state, 'game': str(Path(game).resolve())}
             # Include already-correct engine components in integrity checks as well.
             if engine:
                 for a in manifest['engine']:
@@ -422,7 +549,7 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
             out = stage / 'state.json'; atomic_json(out, state)
             tx.replace(old_state, out)
             tx.commit()
-            log('Installed. Saves are in this profile; existing saves were not changed.')
+            log('Installed. Restart Steam, then use its normal Play button. Existing saves were not changed.')
             return state
         except Exception:
             if tx:
@@ -442,6 +569,10 @@ def check(profile):
     for path, expected in state['engine_files'].items():
         if not Path(path).is_file() or file_sha(path) != expected:
             bad.append(path)
+    if state.get('steam_launch'):
+        data = state['steam_launch']
+        if launch_options(Path(data['path']).read_text(encoding='utf-8-sig')) != data['options']:
+            bad.append('Steam launch options')
     return bad
 
 def restore(profile):
@@ -451,6 +582,7 @@ def restore(profile):
         candidate = next((p for p in receipts if json.loads(p.read_text())['status'] in {'installed', 'installing'}), None)
         if not candidate:
             raise SetupError('No installation to restore.')
+        if any(a.get('steam_options') for a in json.loads(candidate.read_text())['actions']): steam_closed()
         Transaction.restore(candidate)
         return str(candidate)
 
@@ -467,9 +599,13 @@ def play(steam, profile):
     for path, expected in state['engine_files'].items():
         if not Path(path).is_file() or file_sha(path) != expected:
             raise SetupError('An engine component changed. Run Install / Update before playing.')
-    subprocess.Popen([str(Path(steam) / 'steam.exe'), '-applaunch', '108600', '-cachedir=' + str(Path(profile).resolve())])
+    if state.get('steam_launch'):
+        cfg = state['steam_launch']
+        if launch_options(Path(cfg['path']).read_text(encoding='utf-8-sig')) != cfg['options']:
+            raise SetupError('Steam launch options changed. Run Install / Update to configure this profile again.')
+    subprocess.Popen([str(Path(steam) / 'steam.exe'), '-applaunch', '108600'] if state.get('steam_launch') else [str(Path(steam) / 'steam.exe'), '-applaunch', '108600', '-cachedir=' + str(Path(profile).resolve())])
 
-def setup_zombiebuddy(manifest, profile, log=print):
+def setup_zombiebuddy(manifest, profile, log=print, steam=None):
     game_closed()
     steam_closed()
     info = manifest['zombiebuddy']
@@ -484,7 +620,20 @@ def setup_zombiebuddy(manifest, profile, log=print):
             raise SetupError('ZombieBuddy installer checksum mismatch; not executed.')
         target.write_bytes(data)
     log('The official installer copies ZombieBuddy.jar and zbNative.dll and updates Steam launch options. Wait for Installation complete, then press Enter to close its window. Steam can be restarted after our setup finishes.')
-    subprocess.run([str(target)], check=True, creationflags=0x00000010 if sys.platform == 'win32' else 0)
+    before = {}
+    if steam is not None:
+        for cfg in (Path(steam) / 'userdata').glob('*/config/localconfig.vdf'):
+            before[str(cfg)] = launch_options(cfg.read_text(encoding='utf-8-sig'))
+        atomic_json(Path(profile) / '.setup/zombiebuddy-launch-options-before.json', before)
+    try:
+        subprocess.run([str(target)], check=True, creationflags=0x00000010 if sys.platform == 'win32' else 0)
+    finally:
+        # The pinned upstream v4.1 installer replaces launch options. Retain users' existing flags.
+        for filename, original in before.items():
+            cfg = Path(filename)
+            after = launch_options(cfg.read_text(encoding='utf-8-sig'))
+            if after != original and after and '-agentlib:zbNative' in after:
+                write_steam_options(cfg, native_zb_options(original))
     log('ZombieBuddy installer finished. Install / Update verifies the runtime files.')
 
 
@@ -499,7 +648,7 @@ def gui(smoke=False):
     app = tk.Tk(); app.title('Knox County Vanilla++'); app.geometry('760x660')
     frame = ttk.Frame(app, padding=20); frame.pack(fill='both', expand=True)
     ttk.Label(frame, text='Knox County Vanilla++', font=('Segoe UI', 18)).pack(anchor='w')
-    ttk.Label(frame, text='1. Subscribe to Main (Extras optional).  2. Finish downloads and exit Steam.\n3. Install / Update.  4. Use Play to launch this profile through Steam.', wraplength=640).pack(anchor='w', pady=(8, 15))
+    ttk.Label(frame, text='1. Subscribe to Main (Extras optional).  2. Finish downloads and exit Steam.\n3. Install / Update.  4. Start Steam and click its normal Play button.', wraplength=640).pack(anchor='w', pady=(8, 15))
     try:
         initial = str(discover_steam())
     except SetupError:
@@ -546,7 +695,7 @@ def gui(smoke=False):
                 app.after(0, lambda: [b.configure(state='normal') for b in buttons])
         threading.Thread(target=work, daemon=False).start()
     def do_install():
-        if not messagebox.askokcancel('Install / update', 'This prepares the selected mods and installs Better Car Physics components with backups. If needed, the official GitHub ZombieBuddy installer opens first. Existing saves stay separate. Continue?'): return
+        if not messagebox.askokcancel('Install / update', 'This prepares the selected mods and installs Better Car Physics components with backups. If needed, the official GitHub ZombieBuddy installer opens first. Steam Play will open Knox County by default. Existing saves stay separate. Continue?'): return
         config = (steam.get(), profile.get(), extras.get(), xen.get(), adjustments.get())
         def work():
             manifest = json.loads((ROOT / 'integration.json').read_text())
@@ -555,13 +704,14 @@ def gui(smoke=False):
             verify_game_build(game, manifest)
             preflight(manifest, libs, *config[2:])
             if any(not (game / name).is_file() or file_sha(game / name) != h for name, h in manifest['zombiebuddy']['runtime'].items()):
-                setup_zombiebuddy(manifest, config[1], log)
-            install(manifest, libs, game, config[1], *config[2:], log=log)
+                setup_zombiebuddy(manifest, config[1], log, steam=config[0])
+            install(manifest, libs, game, config[1], *config[2:], log=log, steam=config[0])
         run(work)
     def do_zb():
         manifest = json.loads((ROOT / 'integration.json').read_text())
         p = profile.get()
-        run(lambda: setup_zombiebuddy(manifest, p, log))
+        steam_path = steam.get()
+        run(lambda: setup_zombiebuddy(manifest, p, log, steam=steam_path))
     def do_check():
         p = profile.get()
         def work():

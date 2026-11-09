@@ -181,6 +181,78 @@ class SetupTests(unittest.TestCase):
         with mock.patch.object(k.sys,'platform','win32'), mock.patch.object(k.subprocess,'check_output',return_value=b'"explorer.exe","123","Console","1","10 K"\n'):
             k.steam_closed()
 
+    def steam_config(self, account='1', options='-agentlib:zbNative -- -debug'):
+        text='"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "Apps" { "108600" { "Other" "keep me" } "999" { "LaunchOptions" "other game" } } } } } }'
+        text=k.set_launch_options(text,options)
+        path=self.lib/'userdata'/account/'config/localconfig.vdf';path.parent.mkdir(parents=True,exist_ok=True);path.write_text(text)
+        return path
+
+    def test_vdf_edit_is_local_and_handles_quotes_comments_and_missing_keys(self):
+        text='// comment\n"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "Apps" { "108600" { "Other" "a } b" "LaunchOptions" "old" } } } } } }'
+        result=k.set_launch_options(text,'-debug "two words"')
+        self.assertEqual(k.launch_options(result),'-debug "two words"')
+        self.assertEqual(result.replace('"-debug \\"two words\\""','"old"'),text)
+        empty='"UserLocalConfigStore" { "Software" { "Valve" { "Steam" { "Apps" {} } } } }'
+        updated=k.set_launch_options(empty,'new')
+        self.assertEqual(k.launch_options(updated),'new')
+        self.assertIsNone(k.launch_options(k.set_launch_options(updated,None)))
+
+    def test_steam_uses_most_recent_account(self):
+        first=self.steam_config('1');self.steam_config('2')
+        path=self.lib/'config/loginusers.vdf';path.parent.mkdir(parents=True)
+        path.write_text('"users" { "76561197960265729" { "MostRecent" "1" } "76561197960265730" { "MostRecent" "0" } }')
+        self.assertEqual(k.steam_user_config(self.lib),first)
+
+    def test_steam_play_setup_and_restore_preserve_other_config(self):
+        cfg=self.steam_config();before=k.launch_options(cfg.read_text())
+        state=self.install(steam=self.lib)
+        after=k.launch_options(cfg.read_text());self.assertIn('-debug',after);self.assertIn('-cachedir=',after)
+        self.assertEqual(after.count('-agentlib:zbNative'),1)
+        self.assertEqual(k.check(self.profile),[])
+        with mock.patch.object(k.subprocess,'Popen') as run:
+            k.play(self.lib,self.profile)
+            self.assertEqual(run.call_args.args[0],[str(self.lib/'steam.exe'),'-applaunch','108600'])
+        cfg.write_text(cfg.read_text().replace('keep me','changed by Steam'))
+        k.restore(self.profile)
+        self.assertEqual(k.launch_options(cfg.read_text()),before)
+        self.assertIn('changed by Steam',cfg.read_text())
+        self.assertIn('other game',cfg.read_text())
+
+    def test_steam_manual_launch_flag_change_blocks_restore(self):
+        cfg=self.steam_config();self.install(steam=self.lib)
+        k.write_steam_options(cfg,k.launch_options(cfg.read_text())+' -debug-extra')
+        with self.assertRaisesRegex(k.SetupError,'Steam launch options changed'):k.restore(self.profile)
+        self.assertTrue((self.profile/'mods/Example/script.lua').exists())
+
+    def test_steam_config_rolls_back_if_later_install_step_fails(self):
+        cfg=self.steam_config();before=k.launch_options(cfg.read_text());original=k.Transaction.replace
+        def fail(tx,target,staged,folder=False,**kw):
+            if Path(target).name=='state.json':raise OSError('state write failed')
+            return original(tx,target,staged,folder,**kw)
+        with mock.patch.object(k.Transaction,'replace',fail):
+            with self.assertRaises(OSError):self.install(steam=self.lib)
+        self.assertEqual(k.launch_options(cfg.read_text()),before)
+        self.assertFalse((self.profile/'mods').exists())
+
+    def test_cachedir_replacement_and_existing_vm_delimiter(self):
+        value=k.profile_launch_options('-agentlib:zbNative -- -debug "-cachedir=C:/old path" -nosound',self.profile)
+        self.assertEqual(value.count('-cachedir='),1);self.assertNotIn('old path',value)
+        self.assertIn('-debug',value);self.assertIn('-nosound',value)
+        self.assertEqual(k.native_zb_options('-Xmx8g -- -debug'),'-agentlib:zbNative -Xmx8g -- -debug')
+
+    @mock.patch.object(k,'steam_closed')
+    @mock.patch.object(k,'game_closed')
+    def test_upstream_installer_does_not_erase_existing_flags(self,_closed,_steam_closed):
+        import io
+        a=self.steam_config('1','-debug');b=self.steam_config('2','-nosound')
+        self.manifest['zombiebuddy'].update(filename='official.exe',url='https://example.invalid/official.exe',installer_sha256=k.sha(b'official'))
+        def upstream(*args,**kwargs):
+            for cfg in [a,b]:k.write_steam_options(cfg,'-agentlib:zbNative --')
+        with mock.patch.object(k.urllib.request,'urlopen',return_value=io.BytesIO(b'official')),mock.patch.object(k.subprocess,'run',side_effect=upstream):
+            k.setup_zombiebuddy(self.manifest,self.profile,lambda _:None,steam=self.lib)
+        self.assertEqual(k.launch_options(a.read_text()),'-agentlib:zbNative -- -debug')
+        self.assertEqual(k.launch_options(b.read_text()),'-agentlib:zbNative -- -nosound')
+
     def test_second_operation_lock(self):
         with k.installation_lock(self.profile):
             with self.assertRaises(k.SetupError):

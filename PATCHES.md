@@ -55,7 +55,7 @@ These are preferences and extensions, not all bug fixes. Turning them off uses m
 
 ## Engine installation
 
-ZombieBuddy and Better Car Physics need files outside the profile's mod directory. [The setup guide explains exactly what is copied and what changes Steam's launch options.](README.md#what-it-installs) The installer checks the supported PZ build before applying engine changes.
+ZombieBuddy and Better Car Physics need files outside the profile's mod directory. [The setup guide explains exactly what is copied and what changes Steam's launch options.](README.md#what-it-installs) The installer checks the supported PZ build before applying engine changes. It also configures the active Steam account so the normal Steam Play button opens Knox County, preserving unrelated launch flags and backing up the previous Zomboid options.
 
 ## Left out
 
