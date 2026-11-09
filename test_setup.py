@@ -151,17 +151,16 @@ class SetupTests(unittest.TestCase):
         with self.assertRaisesRegex(k.SetupError,'checksum'):
             k.apply_recipe({'kind':'literal','path':'a','data':'YQ==','output_sha256':'bad'}, {})
 
-    def test_play_uses_steam_profile_and_refuses_changed_engine_or_game(self):
+    def test_check_reports_changes_without_launching(self):
+        with self.assertRaisesRegex(k.SetupError, 'not installed yet'): k.check(self.profile)
         self.install()
-        with mock.patch.object(k.subprocess,'Popen') as launch:
-            k.play(self.lib,self.profile)
-            self.assertIn('-applaunch',launch.call_args.args[0])
-            self.assertIn('-cachedir='+str(self.profile.resolve()),launch.call_args.args[0])
-        p=self.game/'zombie/engine.class';p.write_bytes(b'changed')
-        with self.assertRaisesRegex(k.SetupError,'engine component'):k.play(self.lib,self.profile)
-        p.write_bytes(b'override')
+        (self.profile/'mods/default.txt').write_text('game rewrote selection')
+        self.assertEqual(k.check(self.profile), [])
+        (self.game/'zombie/engine.class').write_bytes(b'changed')
         (self.lib/'steamapps/appmanifest_108600.acf').write_text('"buildid" "999"')
-        with self.assertRaisesRegex(k.SetupError,'game build changed'):k.play(self.lib,self.profile)
+        issues=k.check(self.profile)
+        self.assertIn(str((self.game/'zombie/engine.class').resolve()),issues)
+        self.assertTrue(any('Game build changed' in item for item in issues))
 
     @mock.patch.object(k, 'steam_closed')
     @mock.patch.object(k, 'game_closed')
@@ -209,9 +208,6 @@ class SetupTests(unittest.TestCase):
         after=k.launch_options(cfg.read_text());self.assertIn('-debug',after);self.assertIn('-cachedir=',after)
         self.assertEqual(after.count('-agentlib:zbNative'),1)
         self.assertEqual(k.check(self.profile),[])
-        with mock.patch.object(k.subprocess,'Popen') as run:
-            k.play(self.lib,self.profile)
-            self.assertEqual(run.call_args.args[0],[str(self.lib/'steam.exe'),'-applaunch','108600'])
         cfg.write_text(cfg.read_text().replace('keep me','changed by Steam'))
         k.restore(self.profile)
         self.assertEqual(k.launch_options(cfg.read_text()),before)

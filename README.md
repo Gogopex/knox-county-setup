@@ -33,7 +33,7 @@ The executable is unsigned, so Windows may show an unknown-publisher prompt. The
 
 Our manager makes playable copies in `%USERPROFILE%\Zomboid\KnoxCounty\mods`, applies the selected patches, writes that profile's enabled mod list, and seeds the sandbox preset and selected mod preferences. Your usual saves, graphics settings and enabled mod list stay in the usual profile. The new profile starts with its own game settings.
 
-After installation, use **Steam's normal Play button** or your normal Steam game shortcut. The installer adds the Knox County profile argument to Zomboid's Steam launch options for the active account, while preserving unrelated flags. The manager is only needed for installation, updates, checks or restore. Its Play button is optional. New saves go under `%USERPROFILE%\Zomboid\KnoxCounty\Saves`; your usual saves remain in their original folder. Restoring the first installation also returns the previous Steam launch options.
+After installation, use **Steam's normal Play button** or your normal Steam game shortcut. The installer adds the Knox County profile argument to Zomboid's Steam launch options for the active account, while preserving unrelated flags. The manager is only needed for installation, updates, checks or restore. New saves go under `%USERPROFILE%\Zomboid\KnoxCounty\Saves`; your usual saves remain in their original folder. Restoring the first installation also returns the previous Steam launch options.
 
 Outside the profile folder, it also sets up:
 
@@ -45,11 +45,13 @@ ZombieBuddy and the physics overrides affect other profiles using the same game 
 
 See **[Included patches](PATCHES.md)** for the full list, what each changes, and which combinations require them. The manager also has an Included patches link.
 
+The manager has three actions: **Install / Update**, **Check** and **Restore**. The status line shows what is happening and the result; **Copy details** copies the full log when you need help. ZombieBuddy is handled during installation. Launch the game from Steam.
+
 ## Updates, Check and Restore
 
 - **Install / Update:** with the game and Steam closed, rebuilds playable copies from the current Steam downloads and applies compatible integration patches. Your selected options are remembered. If an upstream file changed in a way our patch does not recognize, it stops and keeps the installed playable copies. Download a newer integration release when one is available.
-- **New releases:** checks GitHub and opens the latest release if yours is older. Extract its Windows ZIP and run the new executable against the same profile folder. This version does not replace its own running executable automatically.
-- **Check:** compares managed mod and engine files with the installed record. It checks files, not whether a game session runs correctly.
+- **New releases link:** opens the GitHub download page. Extract its Windows ZIP and run the new executable against the same profile folder. This version does not replace its own running executable automatically.
+- **Check:** compares managed mod and engine files, the game build and Steam launch options with the installed record. It checks files, not whether a game session runs correctly.
 - **Restore:** with the game and Steam closed, returns the previous managed mods, Better Car Physics files and Zomboid launch options. It refuses edited mod/engine files, keeps your edited preferences and leaves saves alone. It cannot undo world changes made while playing. ZombieBuddy installation and removal are separate; the official version currently downloaded does not offer an uninstall menu.
 
 Backups and receipts are in the profile's `.setup/backups` directory. Keep them for rollback. If installation was interrupted, use Restore before retrying.

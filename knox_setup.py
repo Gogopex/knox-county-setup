@@ -19,7 +19,7 @@ import urllib.request
 import webbrowser
 import zipfile
 
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 REPOSITORY = 'Gogopex/knox-county-setup'
 ROOT = Path(__file__).resolve().parent
 
@@ -438,7 +438,7 @@ def game_actions(game, sources, manifest, stage):
     for filename, expected in manifest['zombiebuddy']['runtime'].items():
         runtime = game / filename
         if not runtime.is_file() or file_sha(runtime) != expected:
-            raise SetupError('Run Set up ZombieBuddy first, then Install / Update.')
+            raise SetupError('ZombieBuddy runtime files are missing or different. Run Install / Update again and keep any error from the official installer.')
     return actions
 
 def preflight(manifest, libraries, extras=True, xen=True, adjustments=True):
@@ -474,6 +474,7 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
             raise SetupError('An interrupted installation needs Restore before trying again.')
         if engine:
             verify_game_build(game, manifest)
+        log('Checking Steam downloads and compatibility patches...')
         mods, sources = preflight(manifest, libraries, extras, xen, adjustments)
         old_state = profile / '.setup/state.json'
         if not old_state.exists() and (profile / 'Saves').exists():
@@ -492,8 +493,8 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
         tx = None
         try:
             dest = stage / 'mods'; dest.mkdir()
-            for m in mods:
-                log('Preparing ' + m['name'])
+            for index, m in enumerate(mods, 1):
+                log(f'Preparing {index}/{len(mods)}: ' + m['name'])
                 target = safe(dest, m['folder'])
                 if m.get('workshop'):
                     shutil.copytree(sources[m['folder']], target, ignore=shutil.ignore_patterns('.DS_Store'))
@@ -526,6 +527,7 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
                     settings.append((target, src))
             hashes = tree_hashes(dest)
             game_closed()
+            log('Installing prepared files and backing up the previous setup...')
             tx = Transaction(profile)
             tx.replace(profile / 'mods', dest, folder=True)
             for target, source in external:
@@ -560,19 +562,29 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
 
 def check(profile):
     profile = Path(profile)
-    state = json.loads((profile / '.setup/state.json').read_text())
+    state_file = profile / '.setup/state.json'
+    if pending_transactions(profile):
+        raise SetupError('An interrupted installation needs Restore before trying again.')
+    if not state_file.is_file():
+        raise SetupError('This profile is not installed yet. Use Install / Update first.')
+    state = json.loads(state_file.read_text())
     bad = []
     got = tree_hashes(profile / 'mods')
     for p in sorted(got.keys() | state['mod_hashes'].keys()):
-        if got.get(p) != state['mod_hashes'].get(p):
+        # Normal game use may rewrite the selected-mod list.
+        if p != 'default.txt' and got.get(p) != state['mod_hashes'].get(p):
             bad.append('mods/' + p)
     for path, expected in state['engine_files'].items():
         if not Path(path).is_file() or file_sha(path) != expected:
             bad.append(path)
+    acf = Path(state['game']).parent.parent / 'appmanifest_108600.acf'
+    if not acf.is_file() or not re.search(r'"buildid"\s+"' + re.escape(state['game_build']) + '"', acf.read_text()):
+        bad.append('Game build changed. Use a setup release for your installed game version.')
     if state.get('steam_launch'):
         data = state['steam_launch']
-        if launch_options(Path(data['path']).read_text(encoding='utf-8-sig')) != data['options']:
-            bad.append('Steam launch options')
+        cfg = Path(data['path'])
+        if not cfg.is_file() or launch_options(cfg.read_text(encoding='utf-8-sig')) != data['options']:
+            bad.append('Steam launch options changed. Run Install / Update to configure this profile again.')
     return bad
 
 def restore(profile):
@@ -585,25 +597,6 @@ def restore(profile):
         if any(a.get('steam_options') for a in json.loads(candidate.read_text())['actions']): steam_closed()
         Transaction.restore(candidate)
         return str(candidate)
-
-def play(steam, profile):
-    if not (Path(profile) / '.setup/state.json').exists():
-        raise SetupError('Install the profile first.')
-    if pending_transactions(profile):
-        raise SetupError('Restore the interrupted installation before playing.')
-    state = json.loads((Path(profile) / '.setup/state.json').read_text())
-    game = Path(state['game'])
-    acf = game.parent.parent / 'appmanifest_108600.acf'
-    if not acf.exists() or not re.search(r'"buildid"\s+"' + re.escape(state['game_build']) + '"', acf.read_text()):
-        raise SetupError('The game build changed. Check for a compatible setup release before playing.')
-    for path, expected in state['engine_files'].items():
-        if not Path(path).is_file() or file_sha(path) != expected:
-            raise SetupError('An engine component changed. Run Install / Update before playing.')
-    if state.get('steam_launch'):
-        cfg = state['steam_launch']
-        if launch_options(Path(cfg['path']).read_text(encoding='utf-8-sig')) != cfg['options']:
-            raise SetupError('Steam launch options changed. Run Install / Update to configure this profile again.')
-    subprocess.Popen([str(Path(steam) / 'steam.exe'), '-applaunch', '108600'] if state.get('steam_launch') else [str(Path(steam) / 'steam.exe'), '-applaunch', '108600', '-cachedir=' + str(Path(profile).resolve())])
 
 def setup_zombiebuddy(manifest, profile, log=print, steam=None):
     game_closed()
@@ -637,15 +630,10 @@ def setup_zombiebuddy(manifest, profile, log=print, steam=None):
     log('ZombieBuddy installer finished. Install / Update verifies the runtime files.')
 
 
-def latest_release():
-    req = urllib.request.Request('https://api.github.com/repos/' + REPOSITORY + '/releases/latest', headers={'User-Agent': 'KnoxCountySetup/' + VERSION})
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read(1024 * 1024))
-
 def gui(smoke=False):
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
-    app = tk.Tk(); app.title('Knox County Vanilla++'); app.geometry('760x660')
+    app = tk.Tk(); app.title('Knox County Vanilla++'); app.geometry('760x720'); app.minsize(760, 720)
     frame = ttk.Frame(app, padding=20); frame.pack(fill='both', expand=True)
     ttk.Label(frame, text='Knox County Vanilla++', font=('Segoe UI', 18)).pack(anchor='w')
     ttk.Label(frame, text='1. Subscribe to Main (Extras optional).  2. Finish downloads and exit Steam.\n3. Install / Update.  4. Start Steam and click its normal Play button.', wraplength=640).pack(anchor='w', pady=(8, 15))
@@ -676,23 +664,35 @@ def gui(smoke=False):
     links = ttk.Frame(frame); links.pack(fill='x', pady=8)
     for title, wid in [('Main collection', '3836683250'), ('Optional extras', '3836684696')]:
         ttk.Button(links, text=title, command=lambda w=wid: webbrowser.open('https://steamcommunity.com/sharedfiles/filedetails/?id=' + w)).pack(side='left', padx=(0, 8))
-    ttk.Button(links, text='Included patches', command=lambda: webbrowser.open('https://github.com/' + REPOSITORY + '/blob/main/PATCHES.md')).pack(side='left')
+    for title, url in [('Included patches', '/blob/main/PATCHES.md'), ('Help', '/blob/main/README.md'), ('New releases', '/releases/latest')]:
+        ttk.Button(links, text=title, command=lambda u=url: webbrowser.open('https://github.com/' + REPOSITORY + u)).pack(side='left', padx=(0, 8))
     ttk.Label(frame, text='Windows x64 / PZ 42.21.0. No Python installation needed.\nThe official ZombieBuddy GitHub installer may open in a separate window. It needs Steam closed; press Enter when it finishes. Better Car Physics is installed with backups.', wraplength=640).pack(anchor='w', pady=8)
-    status = tk.Text(frame, height=8, wrap='word'); status.pack(fill='both', expand=True)
+    outcome = tk.StringVar(value='Ready. Choose your options, then Install / Update.')
+    ttk.Label(frame, textvariable=outcome, wraplength=680).pack(anchor='w', pady=(4, 6))
+    progress = ttk.Progressbar(frame, mode='indeterminate'); progress.pack(fill='x', pady=(0, 8))
+    status = tk.Text(frame, height=8, wrap='word', state='disabled'); status.pack(fill='both', expand=True)
+    ttk.Button(frame, text='Copy details', command=lambda: (app.clipboard_clear(), app.clipboard_append(status.get('1.0', 'end-1c')))).pack(anchor='e', pady=(4, 0))
     busy = [False]; buttons = []
     def log(text):
-        app.after(0, lambda: (status.insert('end', text + '\n'), status.see('end')))
-    def run(fn):
+        def append():
+            status.configure(state='normal'); status.insert('end', text + '\n'); status.see('end'); status.configure(state='disabled')
+        app.after(0, append)
+    def run(fn, activity):
         if busy[0]: return
         busy[0] = True
         for b in buttons: b.configure(state='disabled')
+        outcome.set(activity); progress.start(15)
+        log('Knox County Setup ' + VERSION + ': ' + activity)
         def work():
-            try: fn()
+            try:
+                result = fn()
+                app.after(0, lambda: outcome.set(result))
             except Exception as e:
-                log(str(e)); app.after(0, lambda msg=str(e): messagebox.showerror('Setup stopped', msg))
+                log('Stopped: ' + str(e))
+                app.after(0, lambda msg=str(e): (outcome.set('Stopped. ' + msg), messagebox.showerror('Setup stopped', msg)))
             finally:
                 busy[0] = False
-                app.after(0, lambda: [b.configure(state='normal') for b in buttons])
+                app.after(0, lambda: (progress.stop(), [b.configure(state='normal') for b in buttons]))
         threading.Thread(target=work, daemon=False).start()
     def do_install():
         if not messagebox.askokcancel('Install / update', 'This prepares the selected mods and installs Better Car Physics components with backups. If needed, the official GitHub ZombieBuddy installer opens first. Steam Play will open Knox County by default. Existing saves stay separate. Continue?'): return
@@ -700,38 +700,34 @@ def gui(smoke=False):
         def work():
             manifest = json.loads((ROOT / 'integration.json').read_text())
             libs = library_paths(config[0]); game = find_game(libs)
+            game_closed(); steam_closed()
+            log('Checking game version, Steam downloads and compatibility patches...')
             # Resolve every patch input before asking the upstream installer to change the game.
             verify_game_build(game, manifest)
             preflight(manifest, libs, *config[2:])
             if any(not (game / name).is_file() or file_sha(game / name) != h for name, h in manifest['zombiebuddy']['runtime'].items()):
                 setup_zombiebuddy(manifest, config[1], log, steam=config[0])
             install(manifest, libs, game, config[1], *config[2:], log=log, steam=config[0])
-        run(work)
-    def do_zb():
-        manifest = json.loads((ROOT / 'integration.json').read_text())
-        p = profile.get()
-        steam_path = steam.get()
-        run(lambda: setup_zombiebuddy(manifest, p, log, steam=steam_path))
+            return 'Installed. Start Steam and click Play. You can close this manager.'
+        run(work, 'Installing / updating. Keep this window open...')
     def do_check():
         p = profile.get()
         def work():
-            bad = check(p); log('Files match the installed release.' if not bad else 'Changed/missing files:\n' + '\n'.join(bad[:30]))
-        run(work)
+            bad = check(p)
+            result = f'Check found {len(bad)} issue(s). See details below.' if bad else 'Check passed. Managed files, game build and Steam options match.'
+            log(result)
+            for item in bad: log(item)
+            return result
+        run(work, 'Checking installed files, game build and Steam options...')
     def do_restore():
         p = profile.get()
-        if messagebox.askokcancel('Restore', 'Restore the previous managed mods and engine files? Saves remain untouched.'):
-            run(lambda: log('Restored: ' + restore(p)))
-    def do_update():
-        def work():
-            release = latest_release()
-            if release['tag_name'].lstrip('v') == VERSION:
-                log('You have the current setup release. Install / Update also checks your current Steam downloads.')
-            else:
-                log('New release: ' + release['tag_name'] + '. Download and run it to update this profile.')
-                webbrowser.open('https://github.com/' + REPOSITORY + '/releases/latest')
-        run(work)
+        if messagebox.askokcancel('Restore', 'Restore the previous managed mods, engine files and Steam launch options? Saves remain untouched. Steam and the game must be closed.'):
+            def work():
+                log('Restored: ' + restore(p))
+                return 'Restored the previous setup. Saves were not changed. You can restart Steam.'
+            run(work, 'Restoring the previous setup...')
     row = ttk.Frame(frame); row.pack(fill='x', pady=(12, 0))
-    for label, fn in [('Install / Update', do_install), ('ZombieBuddy', do_zb), ('Check', do_check), ('Restore', do_restore), ('New releases', do_update), ('Play', lambda: play(steam.get(), profile.get()))]:
+    for label, fn in [('Install / Update', do_install), ('Check', do_check), ('Restore', do_restore)]:
         def wrapped(f=fn):
             try: f()
             except Exception as e: messagebox.showerror('Setup stopped', str(e))
