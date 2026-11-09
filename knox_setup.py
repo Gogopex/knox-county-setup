@@ -141,6 +141,9 @@ def find_game(libraries):
 def find_source(libraries, mod):
     for lib in libraries:
         item = lib / 'steamapps/workshop/content/108600' / mod['workshop']
+        downloading = lib / 'steamapps/workshop/downloads/108600' / mod['workshop']
+        if downloading.is_dir() and any(downloading.iterdir()):
+            raise SetupError('Wait for Steam to finish downloading ' + mod['name'] + '.')
         source = safe(item / 'mods', mod['upstream_folder'])
         if not source.is_dir():
             continue
@@ -212,12 +215,12 @@ class Transaction:
     def flush(self):
         atomic_json(self.path, self.record)
 
-    def replace(self, target, staged, folder=False):
+    def replace(self, target, staged, folder=False, preserve_edits=False):
         target, staged = Path(target), Path(staged)
         backup = self.root / str(len(self.record['actions']))
         before = tree_hashes(target) if folder else (file_sha(target) if target.exists() else None)
         after = tree_hashes(staged) if folder else file_sha(staged)
-        action = {'target': str(target.resolve()), 'backup': str(backup.resolve()), 'folder': folder, 'before': before, 'after': after}
+        action = {'target': str(target.resolve()), 'backup': str(backup.resolve()), 'folder': folder, 'before': before, 'after': after, 'preserve_edits': preserve_edits}
         if target.exists():
             if folder:
                 # Same filesystem: backup and profile live together.
@@ -245,15 +248,21 @@ class Transaction:
         path = Path(path)
         r = json.loads(path.read_text())
         # Validate every action before restoring any, so a user edit never causes a partial rollback.
+        keep = set()
         for a in reversed(r['actions']):
             target, backup = Path(a['target']), Path(a['backup'])
             now = tree_hashes(target) if a['folder'] else (file_sha(target) if target.exists() else None)
-            if check and now not in (a['after'], a['before']):
+            interrupted_swap = a['folder'] and not target.exists() and backup.exists()
+            if check and now not in (a['after'], a['before']) and not interrupted_swap:
+                if a.get('preserve_edits'):
+                    keep.add(str(target)); continue
                 raise SetupError('File changed since installation; restore stopped: ' + str(target))
             if a['before'] and not backup.exists() and now != a['before']:
                 raise SetupError('Missing restore backup: ' + str(backup))
         for a in reversed(r['actions']):
             target, backup = Path(a['target']), Path(a['backup'])
+            if str(target) in keep:
+                continue
             now = tree_hashes(target) if a['folder'] else (file_sha(target) if target.exists() else None)
             if now == a['before']:
                 continue
@@ -267,6 +276,7 @@ class Transaction:
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup, target)
+        r['preserved_preferences'] = sorted(keep)
         r['status'] = 'restored'
         atomic_json(path, r)
 
@@ -274,11 +284,16 @@ def pending_transactions(profile):
     return [p for p in sorted((Path(profile) / '.setup/backups').glob('*/receipt.json'))
             if json.loads(p.read_text()).get('status') == 'installing']
 
-def game_actions(game, sources, manifest, stage):
-    game, stage = Path(game), Path(stage)
+def verify_game_build(game, manifest):
+    game = Path(game)
     acf = game.parent.parent / 'appmanifest_108600.acf'
     if not acf.exists() or not re.search(r'"buildid"\s+"' + re.escape(manifest['game_build']) + '"', acf.read_text()):
         raise SetupError('This release supports Project Zomboid build ' + manifest['game_build'] + ' (42.21.0). Choose that Steam branch or wait for an updated setup release.')
+
+
+def game_actions(game, sources, manifest, stage):
+    game, stage = Path(game), Path(stage)
+    verify_game_build(game, manifest)
     actions = []
     for i, a in enumerate(manifest['engine']):
         source = safe(sources[a['folder']], a['source'])
@@ -300,19 +315,36 @@ def game_actions(game, sources, manifest, stage):
             raise SetupError('Run Set up ZombieBuddy first, then Install / Update.')
     return actions
 
+def preflight(manifest, libraries, extras=True, xen=True, adjustments=True):
+    mods = selected(manifest, extras, xen, adjustments)
+    sources = {m['folder']: find_source(libraries, m) for m in mods if m.get('workshop')}
+    for m in mods:
+        for pin in m.get('input_pins', []):
+            if file_sha(safe(sources[pin['folder']], pin['path'])) != pin['sha256']:
+                raise SetupError('A compatibility hook needs review after an upstream change: ' + pin['folder'] + '/' + pin['path'])
+        for recipe in m.get('recipes', []):
+            if not recipe.get('adjustment') or adjustments:
+                apply_recipe(recipe, sources)
+    for a in manifest['engine']:
+        if file_sha(safe(sources[a['folder']], a['source'])) != a['sha256']:
+            raise SetupError('An engine component changed upstream. An integration release is needed.')
+    # Check Workshop runtime inputs before invoking the external GitHub installer.
+    if 'ZombieBuddy' in sources:
+        for name, expected in manifest['zombiebuddy']['runtime'].items():
+            if file_sha(sources['ZombieBuddy'] / 'libs' / name) != expected:
+                raise SetupError('ZombieBuddy changed upstream. An integration release is needed.')
+    return mods, sources
+
+
 def install(manifest, libraries, game, profile, extras=True, xen=True, adjustments=True, log=print, engine=True):
     profile = Path(profile).resolve()
     with installation_lock(profile):
         game_closed()
         if pending_transactions(profile):
             raise SetupError('An interrupted installation needs Restore before trying again.')
-        mods = selected(manifest, extras, xen, adjustments)
-        sources = {m['folder']: find_source(libraries, m) for m in mods if m.get('workshop')}
-        for m in mods:
-            for dependency in m.get('input_pins', []):
-                p = safe(sources[dependency['folder']], dependency['path'])
-                if file_sha(p) != dependency['sha256']:
-                    raise SetupError('Compatibility hook needs review after an upstream change: ' + str(p))
+        if engine:
+            verify_game_build(game, manifest)
+        mods, sources = preflight(manifest, libraries, extras, xen, adjustments)
         old_state = profile / '.setup/state.json'
         if not old_state.exists() and (profile / 'Saves').exists():
             raise SetupError('Choose a new Knox County profile directory, separate from existing saves.')
@@ -366,11 +398,13 @@ def install(manifest, libraries, game, profile, extras=True, xen=True, adjustmen
             game_closed()
             tx = Transaction(profile)
             tx.replace(profile / 'mods', dest, folder=True)
-            for target, source in external + settings:
+            for target, source in external:
                 tx.replace(target, source)
+            for target, source in settings:
+                tx.replace(target, source, preserve_edits=True)
             state = {'version': manifest['version'], 'options': {'extras': extras, 'xen': xen, 'adjustments': adjustments},
                      'mod_hashes': hashes, 'engine_files': {str(t.resolve()): file_sha(t) for t, _ in external},
-                     'receipt': str(tx.path.resolve()), 'game': str(Path(game).resolve())}
+                     'receipt': str(tx.path.resolve()), 'game_build': manifest['game_build'], 'game': str(Path(game).resolve())}
             # Include already-correct engine components in integrity checks as well.
             if engine:
                 for a in manifest['engine']:
@@ -417,6 +451,14 @@ def play(steam, profile):
         raise SetupError('Install the profile first.')
     if pending_transactions(profile):
         raise SetupError('Restore the interrupted installation before playing.')
+    state = json.loads((Path(profile) / '.setup/state.json').read_text())
+    game = Path(state['game'])
+    acf = game.parent.parent / 'appmanifest_108600.acf'
+    if not acf.exists() or not re.search(r'"buildid"\s+"' + re.escape(state['game_build']) + '"', acf.read_text()):
+        raise SetupError('The game build changed. Check for a compatible setup release before playing.')
+    for path, expected in state['engine_files'].items():
+        if not Path(path).is_file() or file_sha(path) != expected:
+            raise SetupError('An engine component changed. Run Install / Update before playing.')
     subprocess.Popen([str(Path(steam) / 'steam.exe'), '-applaunch', '108600', '-cachedir=' + str(Path(profile).resolve())])
 
 def setup_zombiebuddy(manifest, profile, log=print):
@@ -461,6 +503,16 @@ def gui(smoke=False):
         ttk.Entry(row, textvariable=value).pack(side='left', fill='x', expand=True)
         ttk.Button(row, text='Browse', command=lambda v=value: v.set(filedialog.askdirectory() or v.get())).pack(side='left')
     extras = tk.BooleanVar(value=True); xen = tk.BooleanVar(value=True); adjustments = tk.BooleanVar(value=True)
+    def remember_options(*_):
+        state = Path(profile.get()) / '.setup/state.json'
+        if state.is_file():
+            try:
+                opts = json.loads(state.read_text())['options']
+                extras.set(opts['extras']); xen.set(opts['xen']); adjustments.set(opts['adjustments'])
+            except (OSError, ValueError, KeyError):
+                pass
+    profile.trace_add('write', remember_options)
+    remember_options()
     for label, value in [('Music, extra vehicles and Lifestyle', extras), ("Xen's inventory interface", xen), ('Our loot, archery, pushing and Lifestyle adjustments', adjustments)]:
         ttk.Checkbutton(frame, text=label, variable=value).pack(anchor='w', pady=3)
     links = ttk.Frame(frame); links.pack(fill='x', pady=8)
@@ -489,9 +541,9 @@ def gui(smoke=False):
         def work():
             manifest = json.loads((ROOT / 'integration.json').read_text())
             libs = library_paths(config[0]); game = find_game(libs)
-            # Check downloads before asking the upstream installer to do anything.
-            for m in selected(manifest, *config[2:]):
-                if m.get('workshop'): find_source(libs, m)
+            # Resolve every patch input before asking the upstream installer to change the game.
+            verify_game_build(game, manifest)
+            preflight(manifest, libs, *config[2:])
             if any(not (game / name).is_file() or file_sha(game / name) != h for name, h in manifest['zombiebuddy']['runtime'].items()):
                 setup_zombiebuddy(manifest, config[1], log)
             install(manifest, libs, game, config[1], *config[2:], log=log)
