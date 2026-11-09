@@ -163,8 +163,9 @@ class SetupTests(unittest.TestCase):
         (self.lib/'steamapps/appmanifest_108600.acf').write_text('"buildid" "999"')
         with self.assertRaisesRegex(k.SetupError,'game build changed'):k.play(self.lib,self.profile)
 
+    @mock.patch.object(k, 'steam_closed')
     @mock.patch.object(k, 'game_closed')
-    def test_zombiebuddy_installer_hash_checked_before_execution(self, _closed):
+    def test_zombiebuddy_installer_hash_checked_before_execution(self, _closed, _steam_closed):
         import io
         self.manifest['zombiebuddy'].update(filename='official.exe',url='https://example.invalid/official.exe',installer_sha256=k.sha(b'official'))
         with mock.patch.object(k.urllib.request,'urlopen',return_value=io.BytesIO(b'bad')), mock.patch.object(k.subprocess,'run') as run:
@@ -173,6 +174,12 @@ class SetupTests(unittest.TestCase):
         with mock.patch.object(k.urllib.request,'urlopen',return_value=io.BytesIO(b'official')), mock.patch.object(k.subprocess,'run') as run:
             k.setup_zombiebuddy(self.manifest,self.profile,lambda _:None)
             run.assert_called_once()
+
+    def test_zombiebuddy_requires_steam_exit(self):
+        with mock.patch.object(k.sys,'platform','win32'), mock.patch.object(k.subprocess,'check_output',return_value=b'"steam.exe","123","Console","1","10 K"\n'):
+            with self.assertRaisesRegex(k.SetupError,'exit Steam'):k.steam_closed()
+        with mock.patch.object(k.sys,'platform','win32'), mock.patch.object(k.subprocess,'check_output',return_value=b'"explorer.exe","123","Console","1","10 K"\n'):
+            k.steam_closed()
 
     def test_second_operation_lock(self):
         with k.installation_lock(self.profile):

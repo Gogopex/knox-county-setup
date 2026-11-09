@@ -19,7 +19,7 @@ import urllib.request
 import webbrowser
 import zipfile
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 REPOSITORY = 'Gogopex/knox-county-setup'
 ROOT = Path(__file__).resolve().parent
 
@@ -74,6 +74,14 @@ def game_closed():
     for row in csv.reader(output.splitlines()):
         if row and row[0].lower() in {'projectzomboid64.exe', 'projectzomboid32.exe', 'java.exe', 'javaw.exe'}:
             raise SetupError('Close Project Zomboid and Java game processes before changing the setup.')
+
+def steam_closed():
+    if sys.platform != 'win32':
+        return
+    output = subprocess.check_output(['tasklist', '/FO', 'CSV', '/NH'], creationflags=0x08000000).decode(errors='replace')
+    if any(row and row[0].lower() == 'steam.exe' for row in csv.reader(output.splitlines())):
+        raise SetupError('For ZombieBuddy installation, exit Steam using Steam > Exit, then click Install / Update again. Its installer changes Steam launch options; Steam must be closed so those changes persist.')
+
 
 @contextmanager
 def installation_lock(profile):
@@ -288,7 +296,7 @@ def verify_game_build(game, manifest):
     game = Path(game)
     acf = game.parent.parent / 'appmanifest_108600.acf'
     if not acf.exists() or not re.search(r'"buildid"\s+"' + re.escape(manifest['game_build']) + '"', acf.read_text()):
-        raise SetupError('This release supports Project Zomboid build ' + manifest['game_build'] + ' (42.21.0). Choose that Steam branch or wait for an updated setup release.')
+        raise SetupError('This release supports Project Zomboid build ' + manifest['game_build'] + ' (42.21.0). Use a setup release matching your installed game version.')
 
 
 def game_actions(game, sources, manifest, stage):
@@ -463,6 +471,7 @@ def play(steam, profile):
 
 def setup_zombiebuddy(manifest, profile, log=print):
     game_closed()
+    steam_closed()
     info = manifest['zombiebuddy']
     target = Path(profile) / '.setup/downloads' / info['filename']
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -474,7 +483,7 @@ def setup_zombiebuddy(manifest, profile, log=print):
         if sha(data) != info['installer_sha256']:
             raise SetupError('ZombieBuddy installer checksum mismatch; not executed.')
         target.write_bytes(data)
-    log('Follow the official installer window. Choose install/update and normal launch. Then return here.')
+    log('The official installer copies ZombieBuddy.jar and zbNative.dll and updates Steam launch options. Wait for Installation complete, then press Enter to close its window. Steam can be restarted after our setup finishes.')
     subprocess.run([str(target)], check=True, creationflags=0x00000010 if sys.platform == 'win32' else 0)
     log('ZombieBuddy installer finished. Install / Update verifies the runtime files.')
 
@@ -487,10 +496,10 @@ def latest_release():
 def gui(smoke=False):
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
-    app = tk.Tk(); app.title('Knox County Vanilla++'); app.geometry('690x560')
+    app = tk.Tk(); app.title('Knox County Vanilla++'); app.geometry('760x660')
     frame = ttk.Frame(app, padding=20); frame.pack(fill='both', expand=True)
     ttk.Label(frame, text='Knox County Vanilla++', font=('Segoe UI', 18)).pack(anchor='w')
-    ttk.Label(frame, text='Steam supplies the mods. This installs our fixes and a separate play profile.', wraplength=640).pack(anchor='w', pady=(8, 15))
+    ttk.Label(frame, text='1. Subscribe to Main (Extras optional).  2. Finish downloads and exit Steam.\n3. Install / Update.  4. Use Play to launch this profile through Steam.', wraplength=640).pack(anchor='w', pady=(8, 15))
     try:
         initial = str(discover_steam())
     except SetupError:
@@ -518,7 +527,8 @@ def gui(smoke=False):
     links = ttk.Frame(frame); links.pack(fill='x', pady=8)
     for title, wid in [('Main collection', '3836683250'), ('Optional extras', '3836684696')]:
         ttk.Button(links, text=title, command=lambda w=wid: webbrowser.open('https://steamcommunity.com/sharedfiles/filedetails/?id=' + w)).pack(side='left', padx=(0, 8))
-    ttk.Label(frame, text='Requires PZ 42.21.0. Close the game and finish Steam downloads first.\nInstall / Update opens the official ZombieBuddy installer if needed. Better Car Physics is installed with backups.', wraplength=640).pack(anchor='w', pady=8)
+    ttk.Button(links, text='Included patches', command=lambda: webbrowser.open('https://github.com/' + REPOSITORY + '/blob/main/PATCHES.md')).pack(side='left')
+    ttk.Label(frame, text='Windows x64 / PZ 42.21.0. No Python installation needed.\nThe official ZombieBuddy GitHub installer may open in a separate window. It needs Steam closed; press Enter when it finishes. Better Car Physics is installed with backups.', wraplength=640).pack(anchor='w', pady=8)
     status = tk.Text(frame, height=8, wrap='word'); status.pack(fill='both', expand=True)
     busy = [False]; buttons = []
     def log(text):
