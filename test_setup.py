@@ -163,7 +163,8 @@ class SetupTests(unittest.TestCase):
         (self.lib/'steamapps/appmanifest_108600.acf').write_text('"buildid" "999"')
         with self.assertRaisesRegex(k.SetupError,'game build changed'):k.play(self.lib,self.profile)
 
-    def test_zombiebuddy_installer_hash_checked_before_execution(self):
+    @mock.patch.object(k, 'game_closed')
+    def test_zombiebuddy_installer_hash_checked_before_execution(self, _closed):
         import io
         self.manifest['zombiebuddy'].update(filename='official.exe',url='https://example.invalid/official.exe',installer_sha256=k.sha(b'official'))
         with mock.patch.object(k.urllib.request,'urlopen',return_value=io.BytesIO(b'bad')), mock.patch.object(k.subprocess,'run') as run:
